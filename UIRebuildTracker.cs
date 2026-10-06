@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Reflection;
 using UnityEngine;
 using UnityEngine.UI;
+using UnityEngine.Serialization;
 #if UNITY_EDITOR
 using UnityEditor;
 #endif
@@ -48,7 +49,8 @@ public class UIRebuildTracker : MonoBehaviour
 
 	[Header("Visualization Settings")]
 	[SerializeField] private float _holdTime = 0.4f;
-	[SerializeField] private float _decaySpeed = 3.0f;
+	[FormerlySerializedAs("_decaySpeed")]
+	[SerializeField] private float _highlightFadeSpeed = 3.0f;
 	[SerializeField] private bool _enableInRuntime = true;
 
 	private object _registryInstance;
@@ -175,7 +177,7 @@ public class UIRebuildTracker : MonoBehaviour
 			}
 			else
 			{
-				info.Intensity -= deltaTime * _decaySpeed;
+				info.Intensity -= deltaTime * _highlightFadeSpeed;
 				if (info.Intensity <= 0f && info.RebuildCountInWindow == 0)
 				{
 					_removeBuffer.Add(rect);
