@@ -1,6 +1,6 @@
 {
   "name": "com.syerin.ui-rebuild-tracker",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "displayName": "UI Rebuild Tracker",
   "description": "uGUI에서 어떤 UI가 얼마나 자주 다시 빌드(Rebuild)되는지 Game 뷰 · Scene 뷰 · Hierarchy에 실시간으로 보여 주는 디버그 도구입니다.",
   "unity": "2022.3",

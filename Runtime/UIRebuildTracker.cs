@@ -1,5 +1,4 @@
 using System;
-using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
 using UnityEngine;
@@ -12,15 +11,14 @@ using UnityEditor;
 namespace Syerin.UIRebuild
 {
     /// <summary>
-    /// uGUI 리빌드 큐(CanvasUpdateRegistry)를 프레임마다 읽어, 어떤 UI가 얼마나 자주 다시 빌드되는지 기록하고 Game 뷰에 그린다.
+    /// uGUI 리빌드 큐(CanvasUpdateRegistry)를 처리되기 직전에 읽어, 어떤 UI가 얼마나 자주 다시 빌드되는지 기록하고 Game 뷰에 그린다.
     /// Scene 뷰 외곽선 · Hierarchy 배지 · Inspector는 UIRebuildTrackerEditor가 같은 데이터로 그린다.
+    /// 레이아웃 큐에는 요소 대신 레이아웃 루트(LayoutRebuilder)가 들어가므로, 같은 처리에서 그 루트 안에서
+    /// Graphic 리빌드된 요소를 원인 후보(CAUSE)로 함께 표시한다.
     /// 원인 찾기용이고 시간(ms)은 재지 않는다. 릴리스 빌드에서는 스스로 꺼진다.
     /// </summary>
     [ExecuteAlways]
     [DisallowMultipleComponent]
-    // 큐는 모든 LateUpdate가 끝난 뒤(Canvas.willRenderCanvases) 처리되고 비워진다.
-    // 다른 스크립트의 LateUpdate가 만든 리빌드까지 보려면 가장 늦게 읽어야 한다.
-    [DefaultExecutionOrder(32000)]
     public class UIRebuildTracker : MonoBehaviour
     {
         [Flags]
@@ -42,6 +40,7 @@ namespace Syerin.UIRebuild
             readonly Queue<int> _frames = new Queue<int>(WindowFrames);
             int _lastFrame = -1;
             int _labelCount = -1;
+            bool _labelCause;
             string _label;
 
             public float HoldTimer;
@@ -49,6 +48,10 @@ namespace Syerin.UIRebuild
 
             // 지금 묶음(유지 시간 안)에서 잡힌 종류. Graphic과 Layout이 둘 다 잡히면 둘 다 켜진다.
             public RebuildType Types;
+
+            // 지금 묶음에서, 이 요소를 품은 레이아웃 루트가 같은 프레임에 레이아웃 리빌드됐다 — 레이아웃을 흔든 원인 후보.
+            public bool IsLayoutCause;
+
             public string ComponentName;
 
             // OnGUI에서 요소마다 GetComponentInParent를 부르지 않도록 처음 볼 때 한 번 찾아 둔다.
@@ -79,16 +82,21 @@ namespace Syerin.UIRebuild
                 }
             }
 
-            // Game 뷰 라벨. 횟수가 바뀔 때만 문자열을 만든다 — OnGUI가 프레임마다 그려도 할당하지 않게.
+            // Game 뷰 라벨. 횟수나 원인 표시가 바뀔 때만 문자열을 만든다 — OnGUI가 프레임마다 그려도 할당하지 않게.
+            // 창 안 횟수가 0이면(창을 벗어나 흐려지는 중) 횟수는 빼고 이름만 둔다.
             public string Label
             {
                 get
                 {
                     var count = _frames.Count;
-                    if (_label == null || count != _labelCount)
+                    if (_label == null || count != _labelCount || IsLayoutCause != _labelCause)
                     {
                         _labelCount = count;
-                        _label = (count >= SpikeThreshold ? "⚠ " : "") + ComponentName + " (" + count + "/" + WindowFrames + "f)";
+                        _labelCause = IsLayoutCause;
+                        _label = (count >= SpikeThreshold ? "⚠ " : "")
+                            + (IsLayoutCause ? "CAUSE · " : "")
+                            + ComponentName
+                            + (count > 0 ? " (" + count + "/" + WindowFrames + "f)" : "");
                     }
 
                     return _label;
@@ -108,12 +116,18 @@ namespace Syerin.UIRebuild
         [SerializeField] float _highlightFadeSpeed = 3.0f;
         [SerializeField] bool _enableInRuntime = true;
 
-        // 리플렉션은 켜질 때 한 번만 한다. 큐 객체(IndexedSet)는 레지스트리가 들고 있는 그대로라 매 프레임 m_List만 읽는다.
-        object _graphicQueue;
-        object _layoutQueue;
-        FieldInfo _listField;
-        bool _reflectionReady;
+        // 리플렉션은 레지스트리가 바뀌었을 때 두 큐 객체를 찾는 데만 쓴다. 큐(IndexedSet)는 IList를 구현하므로, 평소에는
+        // 리플렉션 없이 Count(활성 요소 수)와 인덱서로 읽는다. IndexedSet의 열거자는 지원되지 않아 foreach는 쓰지 않는다.
+        // 레지스트리는 켜질 때 한 번만 찾아 두면 안 된다. 에디터에서 Play에 들어가면 uGUI가 레지스트리를 새로 만들어
+        // (CanvasUpdateRegistry.ResetStaticsOnLoad) 옛 큐에는 아무것도 들어오지 않고, 스크립트를 다시 컴파일하면(도메인 리로드)
+        // 찾아 둔 참조가 비어 버린다. 그래서 읽을 때마다 지금 레지스트리와 비교한다(TryBindQueues).
+        [NonSerialized] CanvasUpdateRegistry _registry;
+        [NonSerialized] IList<ICanvasElement> _graphicQueue;
+        [NonSerialized] IList<ICanvasElement> _layoutQueue;
         static bool s_warnedReflection;
+
+        // 이번 프레임에 레이아웃 리빌드된 루트. Graphic 리빌드 요소가 이 안에 있으면 원인 후보로 표시한다.
+        readonly HashSet<RectTransform> _layoutRoots = new HashSet<RectTransform>();
 
         readonly List<RectTransform> _removeBuffer = new List<RectTransform>(64);
         Texture2D _whiteTex;
@@ -128,8 +142,18 @@ namespace Syerin.UIRebuild
                 return;
             }
 
+            // 둘 이상 있으면 같은 리빌드를 두 번 그린다. 하나만 두도록 알린다.
+            if (Instance != null && Instance != this)
+            {
+                Debug.LogWarning("UIRebuildTracker: 씬에 둘 이상 있습니다. 같은 리빌드를 겹쳐 그리므로 하나만 두세요.", this);
+            }
+
             Instance = this;
-            InitReflection();
+
+            // 큐는 Canvas.willRenderCanvases(CanvasUpdateRegistry.PerformUpdate)에서 처리되고 비워진다. 그 바로 앞에 오는
+            // preWillRenderCanvases에서 읽는다. Canvas.ForceUpdateCanvases()도 두 이벤트를 이 순서로 부르므로, ScrollRect가
+            // 켜지는 프레임처럼 프레임 도중에 큐를 먼저 처리하는 경우도 잡힌다. LateUpdate에서 읽던 1.1.0은 이 경우를 놓쳤다.
+            Canvas.preWillRenderCanvases += OnPreWillRenderCanvases;
 #if UNITY_EDITOR
             EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
 #endif
@@ -137,6 +161,7 @@ namespace Syerin.UIRebuild
 
         void OnDisable()
         {
+            Canvas.preWillRenderCanvases -= OnPreWillRenderCanvases;
 #if UNITY_EDITOR
             EditorApplication.playModeStateChanged -= OnPlayModeStateChanged;
 #endif
@@ -164,51 +189,53 @@ namespace Syerin.UIRebuild
             ActiveData.Clear();
         }
 
-        void InitReflection()
+        // 지금 레지스트리의 두 큐를 읽을 수 있으면 true. 레지스트리가 바뀌었으면 큐를 다시 찾는다.
+        bool TryBindQueues()
         {
-            if (_reflectionReady)
+            var registry = CanvasUpdateRegistry.instance;
+            if (!ReferenceEquals(registry, _registry))
             {
-                return;
+                const BindingFlags instanceFlags = BindingFlags.NonPublic | BindingFlags.Instance;
+                var registryType = typeof(CanvasUpdateRegistry);
+                _registry = registry;
+                _graphicQueue = registryType.GetField("m_GraphicRebuildQueue", instanceFlags)?.GetValue(registry) as IList<ICanvasElement>;
+                _layoutQueue = registryType.GetField("m_LayoutRebuildQueue", instanceFlags)?.GetValue(registry) as IList<ICanvasElement>;
+
+                // uGUI 내부 필드 이름이 바뀌면 아무것도 표시되지 않는다. 조용히 넘어가지 않고 한 번 알린다.
+                if ((_graphicQueue == null || _layoutQueue == null) && !s_warnedReflection)
+                {
+                    s_warnedReflection = true;
+                    Debug.LogWarning("UIRebuildTracker: uGUI 내부 필드(CanvasUpdateRegistry의 리빌드 큐)를 찾지 못해 동작하지 않습니다. uGUI 버전을 확인하세요.");
+                }
             }
 
-            const BindingFlags instanceFlags = BindingFlags.NonPublic | BindingFlags.Instance;
-            var registryType = typeof(CanvasUpdateRegistry);
-            var registry = registryType.GetProperty("instance", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)?.GetValue(null);
-            _graphicQueue = registry == null ? null : registryType.GetField("m_GraphicRebuildQueue", instanceFlags)?.GetValue(registry);
-            _layoutQueue = registry == null ? null : registryType.GetField("m_LayoutRebuildQueue", instanceFlags)?.GetValue(registry);
-            _listField = _graphicQueue?.GetType().GetField("m_List", instanceFlags);
-            _reflectionReady = _graphicQueue != null && _layoutQueue != null && _listField != null;
-
-            // uGUI 내부 필드 이름이 바뀌면 아무것도 표시되지 않는다. 조용히 넘어가지 않고 한 번 알린다.
-            if (!_reflectionReady && !s_warnedReflection)
-            {
-                s_warnedReflection = true;
-                Debug.LogWarning("UIRebuildTracker: uGUI 내부 필드(CanvasUpdateRegistry의 리빌드 큐)를 찾지 못해 동작하지 않습니다. uGUI 버전을 확인하세요.");
-            }
+            return _graphicQueue != null && _layoutQueue != null;
         }
 
-        void LateUpdate()
+        // 한 프레임에 여러 번 불릴 수 있다(ForceUpdateCanvases). 횟수는 프레임당 한 번으로 센다(RecordRebuild).
+        void OnPreWillRenderCanvases()
         {
-            if (!_reflectionReady || (Application.isPlaying && !_enableInRuntime))
+            if ((Application.isPlaying && !_enableInRuntime) || !TryBindQueues())
             {
                 return;
             }
 
+            // 레이아웃 큐를 먼저 읽어 이번 처리의 레이아웃 루트를 모은 뒤, Graphic 리빌드 중 그 루트 안에 있는 요소를 원인 후보로 표시한다.
             var frame = Time.frameCount;
-            Collect(_graphicQueue, RebuildType.Graphic, frame);
+            _layoutRoots.Clear();
             Collect(_layoutQueue, RebuildType.Layout, frame);
+            Collect(_graphicQueue, RebuildType.Graphic, frame);
         }
 
-        void Collect(object queue, RebuildType type, int frame)
+        void Collect(IList<ICanvasElement> queue, RebuildType type, int frame)
         {
-            if (!(_listField.GetValue(queue) is IList elements))
+            for (var i = 0; i < queue.Count; i++)
             {
-                return;
-            }
+                var element = queue[i];
 
-            for (var i = 0; i < elements.Count; i++)
-            {
-                if (!(elements[i] is ICanvasElement element) || !(element.transform is RectTransform rect))
+                // 큐에는 처리되기 전에 파괴된 요소나 루트가 파괴된 LayoutRebuilder가 남아 있을 수 있다(화면을 닫은 프레임 등).
+                // uGUI도 처리 전에 IsDestroyed로 걸러 낸다. 거르지 않고 transform을 쓰면 MissingReferenceException이 난다.
+                if (element == null || element.IsDestroyed() || !(element.transform is RectTransform rect))
                 {
                     continue;
                 }
@@ -223,23 +250,60 @@ namespace Syerin.UIRebuild
                 {
                     info = new RebuildInfo
                     {
-                        ComponentName = element.GetType().Name,
+                        ComponentName = NameOf(element, rect),
                         Canvas = rect.GetComponentInParent<Canvas>(),
                     };
                     ActiveData[rect] = info;
                 }
 
-                // 지난 묶음이 끝난 뒤(유지 시간이 지난 뒤) 다시 잡혔으면 종류를 새로 센다.
+                // 지난 묶음이 끝난 뒤(유지 시간이 지난 뒤) 다시 잡혔으면 종류와 원인 표시를 새로 센다.
                 if (info.HoldTimer <= 0f)
                 {
                     info.Types = RebuildType.None;
+                    info.IsLayoutCause = false;
                 }
 
                 info.Types |= type;
                 info.RecordRebuild(frame);
                 info.HoldTimer = _holdTime;
                 info.Intensity = 1.0f;
+
+                if (type == RebuildType.Layout)
+                {
+                    _layoutRoots.Add(rect);
+                }
+                else if (_layoutRoots.Count > 0 && IsInsideLayoutRoot(rect))
+                {
+                    info.IsLayoutCause = true;
+                }
             }
+        }
+
+        // 레이아웃 큐에는 요소 대신 LayoutRebuilder가 들어 있고, 그 transform은 레이아웃 루트다(리빌드를 요청한 요소가 아니다).
+        // 이름은 루트에 붙은 레이아웃 컴포넌트(LayoutGroup · ContentSizeFitter 등)로 보여 준다.
+        static string NameOf(ICanvasElement element, RectTransform rect)
+        {
+            if (element is Component)
+            {
+                return element.GetType().Name;
+            }
+
+            var controller = rect.GetComponent<ILayoutController>() as Component;
+            return controller != null ? controller.GetType().Name : rect.name;
+        }
+
+        // 부모 쪽에 이번 프레임의 레이아웃 루트가 있는가. 자기 자신이 루트면 이미 LAYOUT+G로 보이므로 부모부터 본다.
+        bool IsInsideLayoutRoot(RectTransform rect)
+        {
+            for (var parent = rect.parent; parent != null; parent = parent.parent)
+            {
+                if (parent is RectTransform parentRect && _layoutRoots.Contains(parentRect))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         void Update()
@@ -332,7 +396,9 @@ namespace Syerin.UIRebuild
 
                 var isCritical = info.IsHighFrequencySpike;
                 var heat = Mathf.Clamp01(info.RebuildCountInWindow / (float)SpikeThreshold);
-                var outlineColor = info.HasLayout ? Color.Lerp(Color.green, Color.red, heat) : Color.Lerp(Color.yellow, Color.red, heat);
+                // 레이아웃 루트는 초록 → 빨강, 원인 후보는 하늘색 → 빨강, 그 밖의 Graphic 리빌드는 노랑 → 빨강
+                var baseColor = info.HasLayout ? Color.green : info.IsLayoutCause ? Color.cyan : Color.yellow;
+                var outlineColor = Color.Lerp(baseColor, Color.red, heat);
                 outlineColor.a = isCritical ? Mathf.PingPong(Time.unscaledTime * 8f, 0.6f) + 0.4f : info.Intensity * 0.8f;
                 DrawOutline(guiRect, outlineColor, isCritical ? 4 : 2);
 
